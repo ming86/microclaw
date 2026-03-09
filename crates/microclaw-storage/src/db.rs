@@ -183,7 +183,7 @@ pub struct AuditLogRecord {
 pub type SessionMetaRow = (String, String, Option<String>, Option<i64>);
 pub type SessionTreeRow = (i64, Option<String>, Option<i64>, String);
 
-const SCHEMA_VERSION_CURRENT: i64 = 13;
+const SCHEMA_VERSION_CURRENT: i64 = 14;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -217,6 +217,8 @@ pub struct ScheduledTaskDlqEntry {
 #[derive(Debug, Clone)]
 pub struct SubagentRunRecord {
     pub run_id: String,
+    pub parent_run_id: Option<String>,
+    pub depth: i64,
     pub chat_id: i64,
     pub caller_channel: String,
     pub task: String,
@@ -651,6 +653,8 @@ fn apply_schema_migrations(conn: &Connection) -> Result<(), MicroClawError> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS subagent_runs (
                 run_id TEXT PRIMARY KEY,
+                parent_run_id TEXT,
+                depth INTEGER NOT NULL DEFAULT 1,
                 chat_id INTEGER NOT NULL,
                 caller_channel TEXT NOT NULL,
                 task TEXT NOT NULL,
@@ -671,10 +675,33 @@ fn apply_schema_migrations(conn: &Connection) -> Result<(), MicroClawError> {
             CREATE INDEX IF NOT EXISTS idx_subagent_runs_chat_created
                 ON subagent_runs(chat_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_subagent_runs_chat_status
-                ON subagent_runs(chat_id, status);",
+                ON subagent_runs(chat_id, status);
+            CREATE INDEX IF NOT EXISTS idx_subagent_runs_parent_status
+                ON subagent_runs(parent_run_id, status);",
         )?;
         set_schema_version(conn, 13)?;
         version = 13;
+    }
+    if version < 14 {
+        if !table_has_column(conn, "subagent_runs", "parent_run_id")? {
+            conn.execute(
+                "ALTER TABLE subagent_runs ADD COLUMN parent_run_id TEXT",
+                [],
+            )?;
+        }
+        if !table_has_column(conn, "subagent_runs", "depth")? {
+            conn.execute(
+                "ALTER TABLE subagent_runs ADD COLUMN depth INTEGER NOT NULL DEFAULT 1",
+                [],
+            )?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subagent_runs_parent_status
+             ON subagent_runs(parent_run_id, status)",
+            [],
+        )?;
+        set_schema_version(conn, 14)?;
+        version = 14;
     }
     if version != SCHEMA_VERSION_CURRENT {
         set_schema_version(conn, SCHEMA_VERSION_CURRENT)?;
@@ -3536,6 +3563,8 @@ impl Database {
     pub fn create_subagent_run(
         &self,
         run_id: &str,
+        parent_run_id: Option<&str>,
+        depth: i64,
         chat_id: i64,
         caller_channel: &str,
         task: &str,
@@ -3547,10 +3576,12 @@ impl Database {
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO subagent_runs(
-                run_id, chat_id, caller_channel, task, context, status, created_at, provider, model
-            ) VALUES (?1, ?2, ?3, ?4, ?5, 'accepted', ?6, ?7, ?8)",
+                run_id, parent_run_id, depth, chat_id, caller_channel, task, context, status, created_at, provider, model
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'accepted', ?8, ?9, ?10)",
             params![
                 run_id,
+                parent_run_id,
+                depth,
                 chat_id,
                 caller_channel,
                 task,
@@ -3643,7 +3674,7 @@ impl Database {
     ) -> Result<Vec<SubagentRunRecord>, MicroClawError> {
         let conn = self.lock_conn();
         let mut stmt = conn.prepare(
-            "SELECT run_id, chat_id, caller_channel, task, context, status, created_at,
+            "SELECT run_id, parent_run_id, depth, chat_id, caller_channel, task, context, status, created_at,
                     started_at, finished_at, cancel_requested, error_text, result_text,
                     input_tokens, output_tokens, total_tokens, provider, model
              FROM subagent_runs
@@ -3654,22 +3685,24 @@ impl Database {
         let rows = stmt.query_map(params![chat_id, limit.max(1) as i64], |row| {
             Ok(SubagentRunRecord {
                 run_id: row.get(0)?,
-                chat_id: row.get(1)?,
-                caller_channel: row.get(2)?,
-                task: row.get(3)?,
-                context: row.get(4)?,
-                status: row.get(5)?,
-                created_at: row.get(6)?,
-                started_at: row.get(7)?,
-                finished_at: row.get(8)?,
-                cancel_requested: row.get::<_, i64>(9)? != 0,
-                error_text: row.get(10)?,
-                result_text: row.get(11)?,
-                input_tokens: row.get(12)?,
-                output_tokens: row.get(13)?,
-                total_tokens: row.get(14)?,
-                provider: row.get(15)?,
-                model: row.get(16)?,
+                parent_run_id: row.get(1)?,
+                depth: row.get(2)?,
+                chat_id: row.get(3)?,
+                caller_channel: row.get(4)?,
+                task: row.get(5)?,
+                context: row.get(6)?,
+                status: row.get(7)?,
+                created_at: row.get(8)?,
+                started_at: row.get(9)?,
+                finished_at: row.get(10)?,
+                cancel_requested: row.get::<_, i64>(11)? != 0,
+                error_text: row.get(12)?,
+                result_text: row.get(13)?,
+                input_tokens: row.get(14)?,
+                output_tokens: row.get(15)?,
+                total_tokens: row.get(16)?,
+                provider: row.get(17)?,
+                model: row.get(18)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -3682,7 +3715,7 @@ impl Database {
     ) -> Result<Option<SubagentRunRecord>, MicroClawError> {
         let conn = self.lock_conn();
         conn.query_row(
-            "SELECT run_id, chat_id, caller_channel, task, context, status, created_at,
+            "SELECT run_id, parent_run_id, depth, chat_id, caller_channel, task, context, status, created_at,
                     started_at, finished_at, cancel_requested, error_text, result_text,
                     input_tokens, output_tokens, total_tokens, provider, model
              FROM subagent_runs
@@ -3691,22 +3724,24 @@ impl Database {
             |row| {
                 Ok(SubagentRunRecord {
                     run_id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    caller_channel: row.get(2)?,
-                    task: row.get(3)?,
-                    context: row.get(4)?,
-                    status: row.get(5)?,
-                    created_at: row.get(6)?,
-                    started_at: row.get(7)?,
-                    finished_at: row.get(8)?,
-                    cancel_requested: row.get::<_, i64>(9)? != 0,
-                    error_text: row.get(10)?,
-                    result_text: row.get(11)?,
-                    input_tokens: row.get(12)?,
-                    output_tokens: row.get(13)?,
-                    total_tokens: row.get(14)?,
-                    provider: row.get(15)?,
-                    model: row.get(16)?,
+                    parent_run_id: row.get(1)?,
+                    depth: row.get(2)?,
+                    chat_id: row.get(3)?,
+                    caller_channel: row.get(4)?,
+                    task: row.get(5)?,
+                    context: row.get(6)?,
+                    status: row.get(7)?,
+                    created_at: row.get(8)?,
+                    started_at: row.get(9)?,
+                    finished_at: row.get(10)?,
+                    cancel_requested: row.get::<_, i64>(11)? != 0,
+                    error_text: row.get(12)?,
+                    result_text: row.get(13)?,
+                    input_tokens: row.get(14)?,
+                    output_tokens: row.get(15)?,
+                    total_tokens: row.get(16)?,
+                    provider: row.get(17)?,
+                    model: row.get(18)?,
                 })
             },
         )
@@ -3735,6 +3770,22 @@ impl Database {
              WHERE chat_id = ?1
                AND status IN ('accepted', 'queued', 'running')",
             params![chat_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn count_active_subagent_children(
+        &self,
+        parent_run_id: &str,
+    ) -> Result<i64, MicroClawError> {
+        let conn = self.lock_conn();
+        conn.query_row(
+            "SELECT COUNT(*)
+             FROM subagent_runs
+             WHERE parent_run_id = ?1
+               AND status IN ('accepted', 'queued', 'running')",
+            params![parent_run_id],
             |row| row.get(0),
         )
         .map_err(Into::into)

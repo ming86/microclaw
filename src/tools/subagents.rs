@@ -20,6 +20,17 @@ use microclaw_storage::db::{call_blocking, Database};
 
 const MAX_SUB_AGENT_ITERATIONS: usize = 16;
 
+#[derive(Debug, Clone, Copy)]
+struct SubagentRuntimeMeta {
+    depth: i64,
+}
+
+fn subagent_runtime_meta_from_input(input: &serde_json::Value) -> Option<SubagentRuntimeMeta> {
+    let meta = input.get("__subagent_runtime")?;
+    let depth = meta.get("depth").and_then(|v| v.as_i64()).unwrap_or(0);
+    Some(SubagentRuntimeMeta { depth })
+}
+
 struct SubagentRuntime {
     semaphore: Semaphore,
     cancel_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
@@ -89,14 +100,22 @@ async fn is_cancelled(
 async fn run_sub_agent_task(
     config: Config,
     db: Arc<Database>,
+    channel_registry: Arc<ChannelRegistry>,
     auth_context: ToolAuthContext,
     run_id: String,
+    depth: i64,
     task: String,
     context: String,
     local_cancel: Arc<AtomicBool>,
 ) -> Result<(String, i64, i64), String> {
     let llm = crate::llm::create_provider(&config);
-    let tools = ToolRegistry::new_sub_agent(&config, db.clone());
+    let allow_session_tools = depth < config.subagents.max_spawn_depth as i64;
+    let tools = ToolRegistry::new_sub_agent(
+        &config,
+        db.clone(),
+        Some(channel_registry),
+        allow_session_tools,
+    );
     let tool_defs = tools.definitions().to_vec();
 
     let system_prompt = "You are a sub-agent assistant. Complete the given task thoroughly and return a clear, concise result. You have access to tools for file operations, search, and web access. Focus on the task and provide actionable output.".to_string();
@@ -202,8 +221,18 @@ async fn run_sub_agent_task(
                     id, name, input, ..
                 } = block
                 {
+                    let mut tool_input = input.clone();
+                    if let Some(obj) = tool_input.as_object_mut() {
+                        obj.insert(
+                            "__subagent_runtime".to_string(),
+                            json!({
+                                "run_id": run_id.clone(),
+                                "depth": depth,
+                            }),
+                        );
+                    }
                     let result = tools
-                        .execute_with_auth(name, input.clone(), &auth_context)
+                        .execute_with_auth(name, tool_input, &auth_context)
                         .await;
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
@@ -370,6 +399,24 @@ impl Tool for SessionsSpawnTool {
             .unwrap_or("")
             .trim()
             .to_string();
+        let parent_meta = subagent_runtime_meta_from_input(&input);
+        let parent_depth = parent_meta.map(|m| m.depth).unwrap_or(0);
+        let child_depth = if parent_depth > 0 {
+            parent_depth + 1
+        } else {
+            1
+        };
+        if child_depth as usize > self.config.subagents.max_spawn_depth {
+            return ToolResult::error(format!(
+                "subagent spawn depth exceeded: requested depth {}, max {}",
+                child_depth, self.config.subagents.max_spawn_depth
+            ));
+        }
+        let parent_run_id = input
+            .get("__subagent_runtime")
+            .and_then(|v| v.get("run_id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
 
         let db_for_count = self.db.clone();
         let active_count = match call_blocking(db_for_count, move |db| {
@@ -388,6 +435,27 @@ impl Tool for SessionsSpawnTool {
                 self.config.subagents.max_active_per_chat
             ));
         }
+        if let Some(parent_id) = parent_run_id.as_ref() {
+            let parent_id_for_count = parent_id.clone();
+            let active_children = match call_blocking(self.db.clone(), move |db| {
+                db.count_active_subagent_children(&parent_id_for_count)
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    return ToolResult::error(format!(
+                        "Failed checking active subagent child runs: {e}"
+                    ));
+                }
+            };
+            if active_children as usize >= self.config.subagents.max_children_per_run {
+                return ToolResult::error(format!(
+                    "Too many active child runs for this parent (limit: {})",
+                    self.config.subagents.max_children_per_run
+                ));
+            }
+        }
 
         let run_id = format!("subrun-{}", uuid::Uuid::new_v4());
         let provider = self.config.llm_provider.clone();
@@ -397,9 +465,12 @@ impl Tool for SessionsSpawnTool {
         let task_for_insert = task.clone();
         let context_for_insert = context.clone();
         let caller_channel_for_insert = auth.caller_channel.clone();
+        let parent_for_insert = parent_run_id.clone();
         if let Err(e) = call_blocking(self.db.clone(), move |db| {
             db.create_subagent_run(
                 &run_id_for_insert,
+                parent_for_insert.as_deref(),
+                child_depth,
                 chat_id,
                 &caller_channel_for_insert,
                 &task_for_insert,
@@ -427,6 +498,7 @@ impl Tool for SessionsSpawnTool {
             env_files: auth.env_files.clone(),
         };
         let channel_registry = self.channel_registry.clone();
+        let subagent_channel_registry = self.channel_registry.clone();
         tokio::spawn(async move {
             let run_id_for_finish = run_id_async.clone();
             let _ = call_blocking(db.clone(), {
@@ -464,8 +536,10 @@ impl Tool for SessionsSpawnTool {
             let run_future = run_sub_agent_task(
                 cfg.clone(),
                 db.clone(),
+                subagent_channel_registry,
                 auth_async,
                 run_id_async.clone(),
+                child_depth,
                 task_async,
                 context_async,
                 local_cancel,
@@ -555,6 +629,8 @@ impl Tool for SessionsSpawnTool {
                 "status": "accepted",
                 "run_id": run_id,
                 "chat_id": chat_id,
+                "depth": child_depth,
+                "parent_run_id": parent_run_id,
             })
             .to_string(),
         )
@@ -626,6 +702,8 @@ impl Tool for SubagentsListTool {
             .map(|r| {
                 json!({
                     "run_id": r.run_id,
+                    "parent_run_id": r.parent_run_id,
+                    "depth": r.depth,
                     "status": r.status,
                     "created_at": r.created_at,
                     "started_at": r.started_at,
@@ -706,6 +784,8 @@ impl Tool for SubagentsInfoTool {
         ToolResult::success(
             json!({
                 "run_id": run.run_id,
+                "parent_run_id": run.parent_run_id,
+                "depth": run.depth,
                 "chat_id": run.chat_id,
                 "caller_channel": run.caller_channel,
                 "task": run.task,

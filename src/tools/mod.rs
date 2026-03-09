@@ -251,8 +251,14 @@ impl ToolRegistry {
         }
     }
 
-    /// Create a restricted tool registry for sub-agents (no side-effect or recursive tools).
-    pub fn new_sub_agent(config: &Config, db: Arc<Database>) -> Self {
+    /// Create a restricted tool registry for sub-agents.
+    /// When `allow_session_tools` is true, orchestration tools are exposed for depth-limited child spawning.
+    pub fn new_sub_agent(
+        config: &Config,
+        db: Arc<Database>,
+        channel_registry: Option<Arc<ChannelRegistry>>,
+        allow_session_tools: bool,
+    ) -> Self {
         let working_dir = PathBuf::from(&config.working_dir);
         if let Err(e) = std::fs::create_dir_all(&working_dir) {
             tracing::warn!(
@@ -268,7 +274,7 @@ impl ToolRegistry {
             Self::build_extra_mounts(&working_dir, &skills_data_dir),
         ));
         let memory_backend = Arc::new(MemoryBackend::local_only(db.clone()));
-        let tools: Vec<Box<dyn Tool>> = vec![
+        let mut tools: Vec<Box<dyn Tool>> = vec![
             Box::new(
                 bash::BashTool::new_with_isolation(
                     &config.working_dir,
@@ -318,10 +324,25 @@ impl ToolRegistry {
                 &config.data_dir,
             )),
             Box::new(structured_memory::StructuredMemorySearchTool::new(
-                db,
+                db.clone(),
                 memory_backend,
             )),
         ];
+        if allow_session_tools {
+            if let Some(channel_registry) = channel_registry {
+                tools.push(Box::new(subagents::SessionsSpawnTool::new(
+                    config,
+                    db.clone(),
+                    channel_registry,
+                )));
+                tools.push(Box::new(subagents::SubagentsListTool::new(db.clone())));
+                tools.push(Box::new(subagents::SubagentsInfoTool::new(db.clone())));
+                tools.push(Box::new(subagents::SubagentsKillTool::new(
+                    config,
+                    db.clone(),
+                )));
+            }
+        }
         ToolRegistry {
             config: config.clone(),
             tools,

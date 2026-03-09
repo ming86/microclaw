@@ -150,6 +150,12 @@ fn default_subagent_run_timeout_secs() -> u64 {
 fn default_subagent_announce() -> bool {
     true
 }
+fn default_subagent_max_spawn_depth() -> usize {
+    1
+}
+fn default_subagent_max_children_per_run() -> usize {
+    5
+}
 
 fn default_model_prices() -> Vec<ModelPrice> {
     Vec::new()
@@ -243,6 +249,10 @@ pub struct SubagentConfig {
     pub run_timeout_secs: u64,
     #[serde(default = "default_subagent_announce")]
     pub announce_to_chat: bool,
+    #[serde(default = "default_subagent_max_spawn_depth")]
+    pub max_spawn_depth: usize,
+    #[serde(default = "default_subagent_max_children_per_run")]
+    pub max_children_per_run: usize,
 }
 
 impl Default for SubagentConfig {
@@ -252,6 +262,8 @@ impl Default for SubagentConfig {
             max_active_per_chat: default_subagent_max_active_per_chat(),
             run_timeout_secs: default_subagent_run_timeout_secs(),
             announce_to_chat: default_subagent_announce(),
+            max_spawn_depth: default_subagent_max_spawn_depth(),
+            max_children_per_run: default_subagent_max_children_per_run(),
         }
     }
 }
@@ -1035,6 +1047,13 @@ Use operator password + API keys for Web auth."
         }
         if self.subagents.run_timeout_secs == 0 {
             self.subagents.run_timeout_secs = default_subagent_run_timeout_secs();
+        }
+        if self.subagents.max_spawn_depth == 0 {
+            self.subagents.max_spawn_depth = default_subagent_max_spawn_depth();
+        }
+        self.subagents.max_spawn_depth = self.subagents.max_spawn_depth.min(5);
+        if self.subagents.max_children_per_run == 0 {
+            self.subagents.max_children_per_run = default_subagent_max_children_per_run();
         }
         self.tool_timeout_overrides = self
             .tool_timeout_overrides
