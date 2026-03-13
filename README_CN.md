@@ -343,9 +343,9 @@ MicroClaw 支持 [Anthropic Agent Skills](https://github.com/anthropics/skills) 
 - `/usage` -- 查看 token 用量统计（当前聊天 + 全局汇总）
 - `/status` -- 查看 provider/model 和当前聊天会话/任务状态
 - `/providers` -- 列出已配置的 provider profile，并标出当前生效项
-- `/provider` -- 查看当前 provider/model（`/provider <profile>` 可切换当前 channel 到该 profile，`/provider reset` 可清除）
+- `/provider` -- 查看当前 provider/model（`/provider <profile>` 可切换当前 channel 到该 profile，并持久化到配置文件；`/provider reset` 可清除）
 - `/models` -- 列出当前 provider 的已配置 model（`/models api` 在支持时拉取 provider 实时模型列表）
-- `/model` -- 查看当前 provider/model（`/model <name>` 可切换当前 channel 的 model override，`/model reset` 可清除）
+- `/model` -- 查看当前 provider/model（`/model <name>` 可切换当前 channel 的 model override，并持久化到配置文件；`/model reset` 可清除）
 
 命令处理规则：
 - 以 `/` 开头的输入会被识别为命令。

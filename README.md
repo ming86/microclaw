@@ -406,9 +406,9 @@ See full manifest schema and examples: `docs/plugins/overview.md`.
 - `/usage` -- show token usage summary (current chat + global totals)
 - `/status` -- show provider/model plus current chat session/task status
 - `/providers` -- list configured provider profiles and show the active one
-- `/provider` -- show current provider/model (`/provider <profile>` switches the current channel to that profile; `/provider reset` clears it)
+- `/provider` -- show current provider/model (`/provider <profile>` switches the current channel to that profile and persists it to config; `/provider reset` clears it)
 - `/models` -- list configured models for the active provider (`/models api` fetches the live provider model list when supported)
-- `/model` -- show current provider/model (`/model <name>` switches the current channel model override; `/model reset` clears it)
+- `/model` -- show current provider/model (`/model <name>` switches the current channel model override and persists it to config; `/model reset` clears it)
 
 Command handling rules:
 - Any input starting with `/` is treated as a command.
