@@ -219,6 +219,14 @@ cargo build --release
 cp target/release/microclaw /usr/local/bin/
 ```
 
+Optional full build with heavier integrations enabled:
+
+```sh
+cargo build --release --features full
+```
+
+`full` currently enables `channel-matrix` and `mcp`. The default build includes all channels except Matrix and omits MCP to keep the release artifact smaller.
+
 Optional semantic-memory build (sqlite-vec disabled by default):
 
 ```sh

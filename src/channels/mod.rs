@@ -4,6 +4,7 @@ pub mod email;
 pub mod feishu;
 pub mod imessage;
 pub mod irc;
+#[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod nostr;
 pub mod qq;
@@ -21,6 +22,7 @@ pub use email::EmailAdapter;
 pub use feishu::FeishuAdapter;
 pub use imessage::IMessageAdapter;
 pub use irc::IrcAdapter;
+#[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixAdapter;
 pub use nostr::NostrAdapter;
 pub use qq::QQAdapter;
