@@ -12,10 +12,12 @@ use serenity::model::id::ChannelId;
 use serenity::prelude::*;
 use tracing::{error, info, warn};
 
-use crate::agent_engine::process_with_agent_with_events;
+use crate::agent_engine::maybe_rerun_for_pending;
+use crate::agent_engine::process_with_agent_with_events_guarded;
 use crate::agent_engine::should_suppress_user_error;
 use crate::agent_engine::AgentEvent;
 use crate::agent_engine::AgentRequestContext;
+use crate::chat_turn_queue::PendingMessage;
 use crate::channels::startup_guard::{
     mark_channel_started, should_drop_pre_start_message, should_drop_recent_duplicate_message,
 };
@@ -554,25 +556,53 @@ impl EventHandler for Handler {
             }
         }
 
+        // If another agent run is active for this chat, queue the message and return early.
+        let discord_chat_type = if msg.guild_id.is_some() {
+            "group"
+        } else {
+            "private"
+        };
+        let turn_guard = match self
+            .app_state
+            .chat_turn_queue
+            .try_start_or_enqueue(
+                &self.runtime.channel_name,
+                channel_id,
+                PendingMessage {
+                    sender_name: sender_name.clone(),
+                    content: text.clone(),
+                    message_id: inbound_message_id.clone(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                },
+            )
+            .await
+        {
+            Some(guard) => guard,
+            None => {
+                info!(
+                    "Discord: message queued (chat busy): chat_id={}, message_id={}",
+                    channel_id, inbound_message_id
+                );
+                return;
+            }
+        };
+
         // Start typing indicator
         let typing = msg.channel_id.start_typing(&ctx.http);
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         // Process with shared agent engine (reuses the same loop as Telegram)
-        match process_with_agent_with_events(
+        match process_with_agent_with_events_guarded(
             &self.app_state,
             AgentRequestContext {
                 caller_channel: &self.runtime.channel_name,
                 chat_id: channel_id,
-                chat_type: if msg.guild_id.is_some() {
-                    "group"
-                } else {
-                    "private"
-                },
+                chat_type: discord_chat_type,
             },
             None,
             None,
             Some(&event_tx),
+            Some(turn_guard),
         )
         .await
         {
@@ -637,6 +667,14 @@ impl EventHandler for Handler {
                 }
             }
         }
+
+        // If messages were queued during this run, re-dispatch to process them.
+        maybe_rerun_for_pending(
+            self.app_state.clone(),
+            &self.runtime.channel_name,
+            channel_id,
+            discord_chat_type,
+        );
     }
 
     async fn ready(&self, _ctx: Context, ready: Ready) {

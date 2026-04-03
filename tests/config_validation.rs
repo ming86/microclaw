@@ -74,6 +74,9 @@ fn minimal_config() -> Config {
         voice_transcription_command: None,
         observability: None,
         channels: std::collections::HashMap::new(),
+        chat_turn_queue_max_pending: 20,
+        parallel_tool_max_concurrency: 8,
+        tool_concurrency_overrides: std::collections::HashMap::new(),
     }
 }
 

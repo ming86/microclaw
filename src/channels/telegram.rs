@@ -10,8 +10,10 @@ use teloxide::types::{ChatAction, InputFile, MessageId, ParseMode, ThreadId};
 use tracing::{debug, error, info, warn};
 
 use crate::agent_engine::{
-    process_with_agent_with_events, should_suppress_user_error, AgentEvent, AgentRequestContext,
+    maybe_rerun_for_pending, process_with_agent_with_events_guarded, should_suppress_user_error,
+    AgentEvent, AgentRequestContext,
 };
+use crate::chat_turn_queue::PendingMessage;
 use crate::channels::startup_guard::{
     mark_channel_started, should_drop_pre_start_message, should_drop_recent_duplicate_message,
 };
@@ -1063,6 +1065,31 @@ async fn handle_message(
         }
     }
 
+    // Atomically try to start a turn or queue the message if a turn is active.
+    let turn_guard = match state
+        .chat_turn_queue
+        .try_start_or_enqueue(
+            &tg_channel_name,
+            chat_id,
+            PendingMessage {
+                sender_name: sender_name.clone(),
+                content: stored_content.clone(),
+                message_id: inbound_message_id.clone(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .await
+    {
+        Some(guard) => guard,
+        None => {
+            info!(
+                "Telegram message queued (chat busy): chat_id={}, message_id={}",
+                chat_id, inbound_message_id
+            );
+            return Ok(());
+        }
+    };
+
     info!(
         "Processing message from {} in chat {}: {}",
         sender_name,
@@ -1088,7 +1115,7 @@ async fn handle_message(
 
     // Process through platform-agnostic agent engine.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    match process_with_agent_with_events(
+    match process_with_agent_with_events_guarded(
         &state,
         AgentRequestContext {
             caller_channel: &tg_channel_name,
@@ -1098,6 +1125,7 @@ async fn handle_message(
         None,
         image_data,
         Some(&event_tx),
+        Some(turn_guard),
     )
     .await
     {
@@ -1204,6 +1232,9 @@ async fn handle_message(
             }
         }
     }
+
+    // If messages were queued during this run, re-dispatch to process them.
+    maybe_rerun_for_pending(state, &tg_channel_name, chat_id, runtime_chat_type);
 
     Ok(())
 }

@@ -9,10 +9,12 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{error, info, warn};
 
-use crate::agent_engine::process_with_agent_with_events;
+use crate::agent_engine::maybe_rerun_for_pending;
+use crate::agent_engine::process_with_agent_with_events_guarded;
 use crate::agent_engine::should_suppress_user_error;
 use crate::agent_engine::AgentEvent;
 use crate::agent_engine::AgentRequestContext;
+use crate::chat_turn_queue::PendingMessage;
 use crate::channels::startup_guard::should_drop_recent_duplicate_message;
 use crate::chat_commands::maybe_handle_plugin_command;
 use crate::chat_commands::{handle_chat_command, is_slash_command, unknown_command_response};
@@ -282,8 +284,6 @@ async fn maybe_plugin_slash_response(
     maybe_handle_plugin_command(config, text, chat_id, channel_name).await
 }
 
-static FEISHU_CHAT_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    OnceLock::new();
 static FEISHU_RUNTIME_START_MS: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 static FEISHU_RUNTIME_BOT_OPEN_ID: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
@@ -323,18 +323,6 @@ fn runtime_bot_open_id(channel_name: &str) -> Option<String> {
         .lock()
         .ok()
         .and_then(|map| map.get(channel_name).cloned())
-}
-
-fn feishu_chat_lock(channel_name: &str, external_chat_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let key = format!("{channel_name}:{external_chat_id}");
-    let cache = FEISHU_CHAT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(mut guard) = cache.lock() else {
-        return Arc::new(tokio::sync::Mutex::new(()));
-    };
-    guard
-        .entry(key)
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -2830,9 +2818,6 @@ async fn handle_feishu_message(
         return;
     }
 
-    let chat_lock = feishu_chat_lock(&runtime.channel_name, external_chat_id);
-    let _guard = chat_lock.lock().await;
-
     // Determine if we should respond
     if !should_respond {
         info!(
@@ -2841,6 +2826,31 @@ async fn handle_feishu_message(
         );
         return;
     }
+
+    let feishu_chat_type = if is_dm { "private" } else { "group" };
+    let turn_guard = match app_state
+        .chat_turn_queue
+        .try_start_or_enqueue(
+            &runtime.channel_name,
+            chat_id,
+            PendingMessage {
+                sender_name: user.to_string(),
+                content: inbound_text.clone(),
+                message_id: inbound_message_id.clone(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .await
+    {
+        Some(guard) => guard,
+        None => {
+            info!(
+                "Feishu: message queued (chat busy): chat_id={}, message_id={}",
+                chat_id, inbound_message_id
+            );
+            return;
+        }
+    };
 
     info!(
         "Feishu message from {} in {}: {}",
@@ -2978,16 +2988,17 @@ async fn handle_feishu_message(
             });
         });
 
-        match process_with_agent_with_events(
+        match process_with_agent_with_events_guarded(
             &app_state,
             AgentRequestContext {
                 caller_channel: &runtime.channel_name,
                 chat_id,
-                chat_type: if is_dm { "private" } else { "group" },
+                chat_type: feishu_chat_type,
             },
             None,
             image_data,
             Some(&event_tx),
+            Some(turn_guard),
         )
         .await
         {
@@ -3170,16 +3181,17 @@ async fn handle_feishu_message(
             }
         }
     } else {
-        match process_with_agent_with_events(
+        match process_with_agent_with_events_guarded(
             &app_state,
             AgentRequestContext {
                 caller_channel: &runtime.channel_name,
                 chat_id,
-                chat_type: if is_dm { "private" } else { "group" },
+                chat_type: feishu_chat_type,
             },
             None,
             image_data,
             Some(&event_tx),
+            Some(turn_guard),
         )
         .await
         {
@@ -3363,6 +3375,9 @@ async fn handle_feishu_message(
             }
         }
     }
+
+    // If messages were queued during this run, re-dispatch to process them.
+    maybe_rerun_for_pending(app_state, &runtime.channel_name, chat_id, feishu_chat_type);
 }
 
 #[cfg(test)]

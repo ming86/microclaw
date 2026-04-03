@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use matrix_sdk::attachment::AttachmentConfig;
@@ -21,10 +21,12 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use crate::agent_engine::process_with_agent_with_events;
+use crate::agent_engine::maybe_rerun_for_pending;
+use crate::agent_engine::process_with_agent_with_events_guarded;
 use crate::agent_engine::should_suppress_user_error;
 use crate::agent_engine::AgentEvent;
 use crate::agent_engine::AgentRequestContext;
+use crate::chat_turn_queue::PendingMessage;
 use crate::channels::startup_guard::{
     mark_channel_started, should_drop_pre_start_message, should_drop_recent_duplicate_message,
 };
@@ -81,21 +83,7 @@ fn matrix_sdk_clients() -> &'static RwLock<HashMap<String, Arc<MatrixSdkClient>>
     CLIENTS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn matrix_chat_locks() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
-    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
-    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
-fn matrix_chat_lock(channel_name: &str, room_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let key = format!("{channel_name}:{room_id}");
-    let Ok(mut guard) = matrix_chat_locks().lock() else {
-        return Arc::new(tokio::sync::Mutex::new(()));
-    };
-    guard
-        .entry(key)
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
-}
 
 fn default_matrix_mention_required() -> bool {
     true
@@ -1706,9 +1694,6 @@ async fn handle_matrix_reaction(
     runtime: MatrixRuntimeContext,
     reaction: MatrixIncomingReaction,
 ) {
-    let chat_lock = matrix_chat_lock(&runtime.channel_name, &reaction.room_id);
-    let _guard = chat_lock.lock().await;
-
     let chat_id = resolve_matrix_chat_id(
         app_state.clone(),
         &runtime,
@@ -2140,9 +2125,6 @@ async fn handle_matrix_message(
         return;
     }
 
-    let chat_lock = matrix_chat_lock(&runtime.channel_name, &msg.room_id);
-    let _guard = chat_lock.lock().await;
-
     let incoming = StoredMessage {
         id: inbound_event_id.clone(),
         chat_id,
@@ -2167,6 +2149,31 @@ async fn handle_matrix_message(
         return;
     }
 
+    let matrix_chat_type = if msg.is_direct { "private" } else { "group" };
+    let turn_guard = match app_state
+        .chat_turn_queue
+        .try_start_or_enqueue(
+            &runtime.channel_name,
+            chat_id,
+            PendingMessage {
+                sender_name: msg.sender.clone(),
+                content: msg.body.clone(),
+                message_id: inbound_event_id.clone(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .await
+    {
+        Some(guard) => guard,
+        None => {
+            info!(
+                "Matrix: message queued (chat busy): chat_id={}, event_id={}",
+                chat_id, inbound_event_id
+            );
+            return;
+        }
+    };
+
     info!(
         "Matrix message from {} in {}: {}",
         msg.sender,
@@ -2180,16 +2187,17 @@ async fn handle_matrix_message(
     let streaming_config = runtime.streaming.clone();
     let use_streaming = streaming_config.enabled;
 
-    match process_with_agent_with_events(
+    match process_with_agent_with_events_guarded(
         &app_state,
         AgentRequestContext {
             caller_channel: &runtime.channel_name,
             chat_id,
-            chat_type: if msg.is_direct { "private" } else { "group" },
+            chat_type: matrix_chat_type,
         },
         None,
         None,
         Some(&event_tx),
+        Some(turn_guard),
     )
     .await
     {
@@ -2332,6 +2340,9 @@ async fn handle_matrix_message(
             }
         }
     }
+
+    // If messages were queued during this run, re-dispatch to process them.
+    maybe_rerun_for_pending(app_state, &runtime.channel_name, chat_id, matrix_chat_type);
 }
 
 #[cfg(test)]
