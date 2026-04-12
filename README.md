@@ -366,6 +366,9 @@ MicroClaw also keeps structured memory rows in SQLite (`memories` table):
 - Explicit "remember ..." commands use a deterministic fast path (direct structured-memory upsert)
 - Low-quality/noisy memories are filtered by quality gates before insertion
 - Memory lifecycle is managed with confidence + soft-archive fields (instead of hard delete)
+- Structured memory injection uses layered loading: L0 Identity (`PROFILE`), L1 Essential (high-confidence), L2 Relevance (query-matched), while deeper recall stays on-demand via `structured_memory_search`
+- Reflector can also extract subject-predicate-object triples into the temporal `knowledge_graph` store for relationship/timeline queries (`knowledge_graph_query` / `knowledge_graph_add`)
+- Structured-memory writes are audit-logged to `<data_dir>/runtime/wal/memory_writes.jsonl` for poisoning/debug analysis
 
 Optional memory MCP backend:
 - If MCP config includes a server exposing both `memory_query` and `memory_upsert`, structured-memory operations prefer that MCP server.
@@ -1093,6 +1096,12 @@ sandbox:
   mode: "off" # optional; default off. set "all" to run bash in a container sandbox
 max_document_size_mb: 100
 memory_token_budget: 1500
+memory_l0_identity_pct: 20       # optional; reserve identity slice from memory budget
+memory_l1_essential_pct: 30      # optional; reserve essential slice from memory budget
+memory_max_entries_per_chat: 200 # optional; 0 = unlimited
+memory_max_global_entries: 500   # optional; 0 = unlimited
+kg_max_triples_per_chat: 1000    # optional; 0 = unlimited
+skill_review_min_tool_calls: 0   # optional; >0 enables post-reflector auto skill review
 timezone: "UTC"
 # optional semantic memory runtime config (requires --features sqlite-vec build)
 # embedding_provider: "openai"   # openai | ollama
@@ -1194,7 +1203,13 @@ All configuration is via `microclaw.config.yaml`:
 | `max_tokens` | No | `8192` | Max tokens per model response |
 | `max_tool_iterations` | No | `100` | Max tool-use loop iterations per message |
 | `max_document_size_mb` | No | `100` | Maximum allowed size for inbound Telegram documents; larger files are rejected with a hint message |
-| `memory_token_budget` | No | `1500` | Estimated token budget for injecting structured memories into prompt context |
+| `memory_token_budget` | No | `1500` | Estimated token budget for layered structured-memory injection (L0+L1+L2) |
+| `memory_l0_identity_pct` | No | `20` | Percentage of `memory_token_budget` reserved for L0 identity (`PROFILE`) memories |
+| `memory_l1_essential_pct` | No | `30` | Percentage of `memory_token_budget` reserved for L1 essential (high-confidence) memories |
+| `memory_max_entries_per_chat` | No | `200` | Max active structured memories per chat (`0` = unlimited) |
+| `memory_max_global_entries` | No | `500` | Max active global structured memories (`0` = unlimited) |
+| `kg_max_triples_per_chat` | No | `1000` | Max active knowledge-graph triples per chat (`0` = unlimited) |
+| `skill_review_min_tool_calls` | No | `0` | Enables post-reflector autonomous skill review when tool-call threshold is met (`0` disables) |
 | `subagents.max_concurrent` | No | `4` | Maximum number of active sub-agent runs across the runtime |
 | `subagents.max_active_per_chat` | No | `5` | Maximum number of active sub-agent runs allowed per chat |
 | `subagents.run_timeout_secs` | No | `900` | Timeout for a single sub-agent run |
