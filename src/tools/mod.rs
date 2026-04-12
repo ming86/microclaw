@@ -6,11 +6,13 @@ pub mod edit_file;
 pub mod export_chat;
 pub mod glob;
 pub mod grep;
+pub mod knowledge_graph;
 pub mod mcp;
 pub mod memory;
 pub mod read_file;
 pub mod schedule;
 pub mod send_message;
+pub mod skill_manage;
 pub mod structured_memory;
 pub mod subagents;
 pub mod sync_skills;
@@ -242,6 +244,10 @@ impl ToolRegistry {
                 &skills_data_dir,
                 &config.data_dir,
             )),
+            Box::new(skill_manage::SkillManageTool::new(
+                &skills_data_dir,
+                config.control_chat_ids.clone(),
+            )),
             Box::new(sync_skills::SyncSkillsTool::new(&skills_data_dir)),
             Box::new(todo::TodoReadTool::new(&config.data_dir)),
             Box::new(todo::TodoWriteTool::new(&config.data_dir)),
@@ -257,6 +263,8 @@ impl ToolRegistry {
                 db.clone(),
                 memory_backend.clone(),
             )),
+            Box::new(knowledge_graph::KnowledgeGraphQueryTool::new(db.clone())),
+            Box::new(knowledge_graph::KnowledgeGraphAddTool::new(db.clone())),
         ];
 
         // Add ClawHub tools if enabled

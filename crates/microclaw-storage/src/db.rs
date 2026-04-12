@@ -106,6 +106,22 @@ pub struct Memory {
     pub archived_at: Option<String>,
 }
 
+/// A single triple in the temporal knowledge graph.
+#[derive(Debug, Clone)]
+pub struct KgTriple {
+    pub id: i64,
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub chat_id: Option<i64>,
+    pub valid_from: String,
+    pub valid_to: Option<String>,
+    pub confidence: f64,
+    pub source: String,
+    pub source_memory_id: Option<i64>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct MemoryObservabilitySummary {
     pub total: i64,
@@ -192,7 +208,7 @@ pub struct AuditLogRecord {
 pub type SessionMetaRow = (String, String, Option<String>, Option<i64>);
 pub type SessionTreeRow = (i64, Option<String>, Option<i64>, String);
 
-const SCHEMA_VERSION_CURRENT: i64 = 19;
+const SCHEMA_VERSION_CURRENT: i64 = 20;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -854,6 +870,37 @@ fn apply_schema_migrations(conn: &Connection) -> Result<(), MicroClawError> {
         set_schema_version(conn, 19)?;
         version = 19;
     }
+    if version < 20 {
+        // Temporal knowledge graph: add valid_from/valid_to to memories + knowledge_graph table
+        if !table_has_column(conn, "memories", "valid_from")? {
+            conn.execute("ALTER TABLE memories ADD COLUMN valid_from TEXT", [])?;
+        }
+        if !table_has_column(conn, "memories", "valid_to")? {
+            conn.execute("ALTER TABLE memories ADD COLUMN valid_to TEXT", [])?;
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS knowledge_graph (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                chat_id INTEGER,
+                valid_from TEXT NOT NULL,
+                valid_to TEXT,
+                confidence REAL NOT NULL DEFAULT 0.70,
+                source TEXT NOT NULL DEFAULT 'reflector',
+                source_memory_id INTEGER,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_kg_subject ON knowledge_graph(subject);
+            CREATE INDEX IF NOT EXISTS idx_kg_object ON knowledge_graph(object);
+            CREATE INDEX IF NOT EXISTS idx_kg_predicate ON knowledge_graph(predicate);
+            CREATE INDEX IF NOT EXISTS idx_kg_chat ON knowledge_graph(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_kg_valid_range ON knowledge_graph(valid_from, valid_to);",
+        )?;
+        set_schema_version(conn, 20)?;
+        version = 20;
+    }
     if version != SCHEMA_VERSION_CURRENT {
         set_schema_version(conn, SCHEMA_VERSION_CURRENT)?;
     }
@@ -1111,6 +1158,11 @@ impl Database {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_memories_confidence ON memories(confidence)",
+            [],
+        )?;
+        // Composite index for archive_excess_memories: covers capacity enforcement queries
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_chat_active_confidence ON memories(chat_id, is_archived, confidence, last_seen_at)",
             [],
         )?;
         conn.execute(
@@ -3436,6 +3488,61 @@ impl Database {
         Ok(rows)
     }
 
+    /// Archive the lowest-confidence, least-recently-seen memories for a chat
+    /// (or global if `chat_id` is None) when the count exceeds `max_entries`.
+    /// Returns the number of memories archived.
+    pub fn archive_excess_memories(
+        &self,
+        chat_id: Option<i64>,
+        max_entries: usize,
+    ) -> Result<usize, MicroClawError> {
+        let conn = self.lock_conn();
+        let count: usize = if let Some(cid) = chat_id {
+            conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE is_archived = 0 AND chat_id = ?1",
+                params![cid],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE is_archived = 0 AND chat_id IS NULL",
+                [],
+                |row| row.get(0),
+            )?
+        };
+        if count <= max_entries {
+            return Ok(0);
+        }
+        let excess = count - max_entries;
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = if let Some(cid) = chat_id {
+            conn.execute(
+                "UPDATE memories SET is_archived = 1, archived_at = ?1, updated_at = ?1
+                 WHERE is_archived = 0 AND chat_id = ?2
+                   AND id IN (
+                     SELECT id FROM memories
+                     WHERE is_archived = 0 AND chat_id = ?2
+                     ORDER BY confidence ASC, COALESCE(last_seen_at, updated_at, created_at) ASC
+                     LIMIT ?3
+                   )",
+                params![now, cid, excess],
+            )?
+        } else {
+            conn.execute(
+                "UPDATE memories SET is_archived = 1, archived_at = ?1, updated_at = ?1
+                 WHERE is_archived = 0 AND chat_id IS NULL
+                   AND id IN (
+                     SELECT id FROM memories
+                     WHERE is_archived = 0 AND chat_id IS NULL
+                     ORDER BY confidence ASC, COALESCE(last_seen_at, updated_at, created_at) ASC
+                     LIMIT ?2
+                   )",
+                params![now, excess],
+            )?
+        };
+        Ok(rows)
+    }
+
     pub fn supersede_memory(
         &self,
         from_memory_id: i64,
@@ -3489,6 +3596,233 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(to_memory_id)
+    }
+
+    // ── Knowledge Graph operations ──
+
+    /// Insert a new knowledge graph triple.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kg_insert_triple(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        chat_id: Option<i64>,
+        valid_from: &str,
+        confidence: f64,
+        source: &str,
+        source_memory_id: Option<i64>,
+    ) -> Result<i64, MicroClawError> {
+        let conn = self.lock_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO knowledge_graph (subject, predicate, object, chat_id, valid_from, valid_to, confidence, source, source_memory_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9)",
+            params![
+                subject,
+                predicate,
+                object,
+                chat_id,
+                valid_from,
+                confidence.clamp(0.0, 1.0),
+                source,
+                source_memory_id,
+                now
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Invalidate a triple by setting its valid_to timestamp.
+    pub fn kg_invalidate_triple(&self, id: i64, valid_to: &str) -> Result<bool, MicroClawError> {
+        let conn = self.lock_conn();
+        let rows = conn.execute(
+            "UPDATE knowledge_graph SET valid_to = ?1 WHERE id = ?2 AND valid_to IS NULL",
+            params![valid_to, id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Query triples by subject, optionally filtered by a point-in-time (as_of).
+    pub fn kg_query_subject(
+        &self,
+        subject: &str,
+        chat_id: Option<i64>,
+        as_of: Option<&str>,
+    ) -> Result<Vec<KgTriple>, MicroClawError> {
+        let conn = self.lock_conn();
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<KgTriple> {
+            Ok(KgTriple {
+                id: row.get(0)?,
+                subject: row.get(1)?,
+                predicate: row.get(2)?,
+                object: row.get(3)?,
+                chat_id: row.get(4)?,
+                valid_from: row.get(5)?,
+                valid_to: row.get(6)?,
+                confidence: row.get(7)?,
+                source: row.get(8)?,
+                source_memory_id: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        };
+        if let Some(ts) = as_of {
+            let mut stmt = conn.prepare(
+                "SELECT id, subject, predicate, object, chat_id, valid_from, valid_to, confidence, source, source_memory_id, created_at
+                 FROM knowledge_graph
+                 WHERE LOWER(subject) = LOWER(?1)
+                   AND (?2 IS NULL OR chat_id = ?2 OR chat_id IS NULL)
+                   AND valid_from <= ?3
+                   AND (valid_to IS NULL OR valid_to > ?3)
+                 ORDER BY valid_from DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![subject, chat_id, ts], map_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, subject, predicate, object, chat_id, valid_from, valid_to, confidence, source, source_memory_id, created_at
+                 FROM knowledge_graph
+                 WHERE LOWER(subject) = LOWER(?1)
+                   AND (?2 IS NULL OR chat_id = ?2 OR chat_id IS NULL)
+                   AND valid_to IS NULL
+                 ORDER BY valid_from DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![subject, chat_id], map_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        }
+    }
+
+    /// Query triples by object (reverse lookup).
+    pub fn kg_query_object(
+        &self,
+        object: &str,
+        chat_id: Option<i64>,
+    ) -> Result<Vec<KgTriple>, MicroClawError> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, subject, predicate, object, chat_id, valid_from, valid_to, confidence, source, source_memory_id, created_at
+             FROM knowledge_graph
+             WHERE LOWER(object) = LOWER(?1)
+               AND (?2 IS NULL OR chat_id = ?2 OR chat_id IS NULL)
+               AND valid_to IS NULL
+             ORDER BY valid_from DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![object, chat_id], |row| {
+                Ok(KgTriple {
+                    id: row.get(0)?,
+                    subject: row.get(1)?,
+                    predicate: row.get(2)?,
+                    object: row.get(3)?,
+                    chat_id: row.get(4)?,
+                    valid_from: row.get(5)?,
+                    valid_to: row.get(6)?,
+                    confidence: row.get(7)?,
+                    source: row.get(8)?,
+                    source_memory_id: row.get(9)?,
+                    created_at: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Get a timeline of all triples for a subject, including invalidated ones.
+    pub fn kg_timeline(
+        &self,
+        subject: &str,
+        chat_id: Option<i64>,
+    ) -> Result<Vec<KgTriple>, MicroClawError> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, subject, predicate, object, chat_id, valid_from, valid_to, confidence, source, source_memory_id, created_at
+             FROM knowledge_graph
+             WHERE LOWER(subject) = LOWER(?1)
+               AND (?2 IS NULL OR chat_id = ?2 OR chat_id IS NULL)
+             ORDER BY valid_from ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![subject, chat_id], |row| {
+                Ok(KgTriple {
+                    id: row.get(0)?,
+                    subject: row.get(1)?,
+                    predicate: row.get(2)?,
+                    object: row.get(3)?,
+                    chat_id: row.get(4)?,
+                    valid_from: row.get(5)?,
+                    valid_to: row.get(6)?,
+                    confidence: row.get(7)?,
+                    source: row.get(8)?,
+                    source_memory_id: row.get(9)?,
+                    created_at: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Get knowledge graph stats (total triples, active, invalidated).
+    pub fn kg_stats(&self, chat_id: Option<i64>) -> Result<(usize, usize, usize), MicroClawError> {
+        let conn = self.lock_conn();
+        let total: usize = conn.query_row(
+            "SELECT COUNT(*) FROM knowledge_graph WHERE (?1 IS NULL OR chat_id = ?1 OR chat_id IS NULL)",
+            params![chat_id],
+            |row| row.get(0),
+        )?;
+        let active: usize = conn.query_row(
+            "SELECT COUNT(*) FROM knowledge_graph WHERE valid_to IS NULL AND (?1 IS NULL OR chat_id = ?1 OR chat_id IS NULL)",
+            params![chat_id],
+            |row| row.get(0),
+        )?;
+        Ok((total, active, total.saturating_sub(active)))
+    }
+
+    /// Delete oldest invalidated triples when count exceeds max_triples for a chat.
+    /// If still over limit after pruning invalidated, also deletes oldest active triples by confidence.
+    pub fn kg_prune_excess(
+        &self,
+        chat_id: i64,
+        max_triples: usize,
+    ) -> Result<usize, MicroClawError> {
+        let conn = self.lock_conn();
+        let count: usize = conn.query_row(
+            "SELECT COUNT(*) FROM knowledge_graph WHERE chat_id = ?1",
+            params![chat_id],
+            |row| row.get(0),
+        )?;
+        if count <= max_triples {
+            return Ok(0);
+        }
+        let excess = count - max_triples;
+        // First: delete invalidated triples (oldest first)
+        let deleted_invalidated = conn.execute(
+            "DELETE FROM knowledge_graph WHERE id IN (
+                SELECT id FROM knowledge_graph
+                WHERE chat_id = ?1 AND valid_to IS NOT NULL
+                ORDER BY created_at ASC
+                LIMIT ?2
+            )",
+            params![chat_id, excess],
+        )?;
+        let remaining_excess = excess.saturating_sub(deleted_invalidated);
+        if remaining_excess == 0 {
+            return Ok(deleted_invalidated);
+        }
+        // Still over: delete lowest-confidence active triples
+        let deleted_active = conn.execute(
+            "DELETE FROM knowledge_graph WHERE id IN (
+                SELECT id FROM knowledge_graph
+                WHERE chat_id = ?1 AND valid_to IS NULL
+                ORDER BY confidence ASC, created_at ASC
+                LIMIT ?2
+            )",
+            params![chat_id, remaining_excess],
+        )?;
+        Ok(deleted_invalidated + deleted_active)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -749,6 +749,8 @@ async fn process_with_agent_logic(
         chat_id,
         &query,
         state.config.memory_token_budget,
+        state.config.memory_l0_identity_pct,
+        state.config.memory_l1_essential_pct,
     )
     .await;
     let memory_context = format!("{}{}", file_memory, db_memory);
@@ -1365,6 +1367,31 @@ async fn process_with_agent_logic(
             metrics.tool_calls += tool_metrics.tool_calls;
             metrics.tool_errors += tool_metrics.tool_errors;
 
+            // Inject iteration budget warning if approaching the limit
+            let max_iter = state.config.max_tool_iterations;
+            let current_iter = iteration + 1; // 1-based
+            let budget_warning = if max_iter > 0 {
+                let pct = (current_iter * 100) / max_iter;
+                let remaining = max_iter.saturating_sub(current_iter);
+                if pct >= 90 {
+                    Some(format!(
+                        "\n<system_notice type=\"iteration_budget\" severity=\"urgent\">\nOnly {remaining} iteration(s) remaining out of {max_iter}. Provide your final answer now.\n</system_notice>"
+                    ))
+                } else if pct >= 70 {
+                    Some(format!(
+                        "\n<system_notice type=\"iteration_budget\" severity=\"warning\">\nYou've used {current_iter}/{max_iter} iterations. Start wrapping up and prepare your answer.\n</system_notice>"
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let mut tool_results = tool_results;
+            if let Some(warning) = budget_warning {
+                tool_results.push(ContentBlock::Text { text: warning });
+            }
+
             messages.push(Message {
                 role: "user".into(),
                 content: MessageContent::Blocks(tool_results),
@@ -1789,7 +1816,7 @@ Built-in execution playbook:
     }
 
     if !memory_context.is_empty() {
-        prompt.push_str("\n# Memories\n\n");
+        prompt.push_str("\n# Memories\n\nMemories are organized in layers: Identity (user profile), Essential (high-confidence facts), and Relevant (query-matched). For deeper recall, use the `structured_memory_search` tool.\n\n");
         prompt.push_str(memory_context);
     }
 
@@ -2465,10 +2492,13 @@ mod tests {
             .unwrap();
 
         let memory_backend = Arc::new(crate::memory_backend::MemoryBackend::local_only(db.clone()));
-        let context = build_db_memory_context(&memory_backend, &db, None, 100, "short", 20).await;
+        let context = build_db_memory_context(&memory_backend, &db, None, 100, "short", 20, 20, 30).await;
         assert!(context.contains("<structured_memories>"));
-        assert!(context.contains("(+"));
-        assert!(context.contains("memories omitted"));
+        // With a tiny budget (20 tokens), not all memories fit — some are available via deep search
+        assert!(
+            context.contains("memories available via") || context.contains("(+"),
+            "Expected omission notice in: {context}"
+        );
         assert!(context.contains("</structured_memories>"));
 
         let _ = std::fs::remove_dir_all(dir);
@@ -2484,10 +2514,10 @@ mod tests {
 
         let memory_backend = Arc::new(crate::memory_backend::MemoryBackend::local_only(db.clone()));
         let context =
-            build_db_memory_context(&memory_backend, &db, None, 100, "likes", 10_000).await;
+            build_db_memory_context(&memory_backend, &db, None, 100, "likes", 10_000, 20, 30).await;
         assert!(context.contains("user likes rust"));
         assert!(context.contains("user likes coffee"));
-        assert!(!context.contains("memories omitted"));
+        assert!(!context.contains("memories available via"));
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2502,12 +2532,21 @@ mod tests {
 
         let memory_backend = Arc::new(crate::memory_backend::MemoryBackend::local_only(db.clone()));
         let context =
-            build_db_memory_context(&memory_backend, &db, None, 100, "喜欢 咖啡", 10_000).await;
-        let first_line = context
+            build_db_memory_context(&memory_backend, &db, None, 100, "喜欢 咖啡", 10_000, 20, 30).await;
+        // Both PROFILE memories should be in L0 (Identity layer)
+        assert!(
+            context.contains("用户喜欢咖啡和编程"),
+            "CJK memory should be present in context"
+        );
+        // The CJK memory should appear (both are PROFILE, order depends on confidence/insertion)
+        let profile_lines: Vec<&str> = context
             .lines()
-            .find(|line| line.starts_with('['))
-            .unwrap_or("");
-        assert!(first_line.contains("用户喜欢咖啡和编程"));
+            .filter(|line| line.starts_with("[PROFILE]"))
+            .collect();
+        assert!(
+            profile_lines.len() == 2,
+            "Expected 2 PROFILE lines, got: {profile_lines:?}"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2581,6 +2620,8 @@ mod tests {
                 chat_id,
                 "database port",
                 1500,
+                20,
+                30,
             )
             .await;
             assert!(

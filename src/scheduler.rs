@@ -293,8 +293,21 @@ Rules:
 - Each memory < 100 characters, specific and concrete
 - Category must be exactly one of: PROFILE (user attributes/preferences), KNOWLEDGE (facts/expertise), EVENT (significant things that happened)
 - If a new memory updates or supersedes an existing one, add "supersedes_id": <id> to replace it
-- Output ONLY valid JSON array: [{"content":"...","category":"PROFILE","supersedes_id":null}]
-- If nothing worth remembering: []
+
+Output format — a JSON object with two arrays:
+{
+  "memories": [{"content":"...","category":"PROFILE","supersedes_id":null}],
+  "triples": [{"subject":"User","predicate":"prefers","object":"Rust"}]
+}
+
+"memories" — flat text memories (same as before).
+"triples" — structured entity relationships for the knowledge graph. Extract these when you see clear subject-predicate-object patterns:
+  - subject: an entity name (person, project, service, tool)
+  - predicate: a relationship (uses, prefers, located_at, version_is, works_on, manages, depends_on)
+  - object: the related entity or value
+  Only extract triples with clear, factual relationships. Skip vague or uncertain ones.
+
+If nothing worth remembering: {"memories":[],"triples":[]}
 
 CRITICAL — how to memorize bugs and problems:
 - NEVER describe broken behavior as a fact (e.g. "tool calls were broken", "agent typed tool calls as text"). This causes the agent to repeat the broken behavior in future sessions.
@@ -366,6 +379,80 @@ fn strip_reflector_thinking_tags(input: &str) -> String {
     strip_tag(&cleaned, "<notepad>", "</notepad>")
 }
 
+/// Parse reflector LLM response. Supports two formats:
+///
+/// 1. New object: `{"memories":[...],"triples":[...]}`
+/// 2. Legacy array: `[{"content":"...","category":"..."}]`
+///
+/// Returns `(memory_extractions, kg_triples)`.
+fn parse_reflector_response(
+    raw_text: &str,
+    chat_id: i64,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let cleaned = strip_reflector_thinking_tags(raw_text);
+    let trimmed = cleaned.trim();
+
+    // Try parsing as the new object format first
+    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(obj) = obj.as_object() {
+            let memories = obj
+                .get("memories")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let triples = obj
+                .get("triples")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            return (memories, triples);
+        }
+    }
+
+    // Try extracting JSON object from noise
+    if let Some(start) = trimmed.find('{') {
+        if let Some(end) = trimmed.rfind('}') {
+            if end > start {
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]) {
+                    if let Some(obj) = obj.as_object() {
+                        let memories = obj
+                            .get("memories")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        let triples = obj
+                            .get("triples")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        return (memories, triples);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fall back to legacy array format (no triples)
+    if let Ok(arr) = parse_reflector_json_array(trimmed) {
+        return (arr, Vec::new());
+    }
+
+    // Last resort: find array in noise
+    let start = trimmed.find('[').unwrap_or(0);
+    let end = trimmed.rfind(']').map(|i| i + 1).unwrap_or(trimmed.len());
+    if start < end {
+        if let Ok(arr) = parse_reflector_json_array(&trimmed[start..end]) {
+            return (arr, Vec::new());
+        }
+    }
+
+    error!(
+        "Reflector: parse failed for chat {}: no valid JSON found",
+        chat_id
+    );
+    (Vec::new(), Vec::new())
+}
+
 fn parse_reflector_json_array(text: &str) -> Result<Vec<serde_json::Value>, serde_json::Error> {
     let cleaned = strip_reflector_thinking_tags(text);
     let trimmed = cleaned.trim();
@@ -407,6 +494,22 @@ async fn run_reflector(state: &Arc<AppState>) {
 
     let _ = call_blocking(state.db.clone(), move |db| db.archive_stale_memories(30)).await;
 
+    // Enforce global memory capacity limit
+    if state.config.memory_max_global_entries > 0 {
+        let max_global = state.config.memory_max_global_entries;
+        let _ = call_blocking(state.db.clone(), move |db| {
+            let archived = db.archive_excess_memories(None, max_global)?;
+            if archived > 0 {
+                info!(
+                    "Reflector: archived {} excess global memories (limit: {})",
+                    archived, max_global
+                );
+            }
+            Ok(())
+        })
+        .await;
+    }
+
     let lookback_secs = (state.config.reflector_interval_mins * 2 * 60) as i64;
     let since = (Utc::now() - chrono::Duration::seconds(lookback_secs)).to_rfc3339();
 
@@ -422,8 +525,15 @@ async fn run_reflector(state: &Arc<AppState>) {
         }
     };
 
-    for chat_id in chat_ids {
+    for chat_id in chat_ids.iter().copied() {
         reflect_for_chat(state, chat_id).await;
+    }
+
+    // Run skill review for active chats if enabled
+    if state.config.skill_review_min_tool_calls > 0 {
+        for chat_id in chat_ids {
+            review_for_skill_creation(state, chat_id).await;
+        }
     }
 }
 
@@ -546,63 +656,11 @@ async fn reflect_for_chat(state: &Arc<AppState>, chat_id: i64) {
         .collect::<Vec<_>>()
         .join("");
 
-    // 7. Parse JSON array
-    let extracted: Vec<serde_json::Value> = match parse_reflector_json_array(text.trim()) {
-        Ok(v) => v,
-        Err(_) => {
-            let cleaned = strip_reflector_thinking_tags(&text);
-            let start = cleaned.find('[').unwrap_or(0);
-            let end = cleaned.rfind(']').map(|i| i + 1).unwrap_or(cleaned.len());
-            if start >= end {
-                error!("Reflector: parse failed for chat {chat_id}: no JSON array found");
-                let finished_at = Utc::now().to_rfc3339();
-                let _ = call_blocking(state.db.clone(), move |db| {
-                    db.log_reflector_run(
-                        chat_id,
-                        &started_at,
-                        &finished_at,
-                        0,
-                        0,
-                        0,
-                        0,
-                        "none",
-                        false,
-                        Some("no JSON array found"),
-                    )
-                    .map(|_| ())
-                })
-                .await;
-                return;
-            }
-            match parse_reflector_json_array(&cleaned[start..end]) {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("Reflector: parse failed for chat {chat_id}: {e}");
-                    let finished_at = Utc::now().to_rfc3339();
-                    let error_msg = e.to_string();
-                    let _ = call_blocking(state.db.clone(), move |db| {
-                        db.log_reflector_run(
-                            chat_id,
-                            &started_at,
-                            &finished_at,
-                            0,
-                            0,
-                            0,
-                            0,
-                            "none",
-                            false,
-                            Some(&error_msg),
-                        )
-                        .map(|_| ())
-                    })
-                    .await;
-                    return;
-                }
-            }
-        }
-    };
+    // 7. Parse response — supports both new object format {"memories":[...],"triples":[...]}
+    //    and legacy array format [{"content":"...","category":"..."}]
+    let (extracted, kg_triples) = parse_reflector_response(&text, chat_id);
 
-    if extracted.is_empty() {
+    if extracted.is_empty() && kg_triples.is_empty() {
         if let Some(ts) = latest_message_ts {
             let _ = call_blocking(state.db.clone(), move |db| {
                 db.set_reflector_cursor(chat_id, &ts)
@@ -628,7 +686,7 @@ async fn reflect_for_chat(state: &Arc<AppState>, chat_id: i64) {
                 .as_deref()
                 .unwrap_or("unknown")
         );
-        let skipped_count = extracted.len();
+        let skipped_count = extracted.len() + kg_triples.len();
         let _ = call_blocking(state.db.clone(), move |db| {
             db.log_reflector_run(
                 chat_id,
@@ -648,12 +706,101 @@ async fn reflect_for_chat(state: &Arc<AppState>, chat_id: i64) {
         return;
     }
 
-    // 8. Insert new memories or update superseded ones
+    // 8. Insert new memories or update superseded ones.
+    //    If the LLM returned triples but no memories, convert triples to memories as fallback
+    //    so that facts are not silently lost from the structured_memories context.
+    let extracted = if extracted.is_empty() && !kg_triples.is_empty() {
+        info!(
+            "Reflector: chat {} — LLM returned {} triples but 0 memories, converting triples to memories as fallback",
+            chat_id, kg_triples.len()
+        );
+        kg_triples
+            .iter()
+            .filter_map(|t| {
+                let s = t.get("subject")?.as_str()?;
+                let p = t.get("predicate")?.as_str()?;
+                let o = t.get("object")?.as_str()?;
+                Some(serde_json::json!({
+                    "content": format!("{s} {p} {o}"),
+                    "category": "KNOWLEDGE",
+                }))
+            })
+            .collect()
+    } else {
+        extracted
+    };
+
     let outcome = apply_reflector_extractions(state, chat_id, &existing, &extracted).await;
     let inserted = outcome.inserted;
     let updated = outcome.updated;
     let skipped = outcome.skipped;
     let dedup_method = outcome.dedup_method;
+
+    // 9. Populate knowledge graph from extracted triples
+    if !kg_triples.is_empty() {
+        let mut kg_inserted = 0usize;
+        for triple in &kg_triples {
+            let subject = match triple.get("subject").and_then(|v| v.as_str()) {
+                Some(s) if !s.trim().is_empty() => s.trim(),
+                _ => continue,
+            };
+            let predicate = match triple.get("predicate").and_then(|v| v.as_str()) {
+                Some(p) if !p.trim().is_empty() => p.trim(),
+                _ => continue,
+            };
+            let object = match triple.get("object").and_then(|v| v.as_str()) {
+                Some(o) if !o.trim().is_empty() => o.trim(),
+                _ => continue,
+            };
+            let now = Utc::now().to_rfc3339();
+            let s = subject.to_string();
+            let p = predicate.to_string();
+            let o = object.to_string();
+            let vf = now.clone();
+            let _ = call_blocking(state.db.clone(), move |db| {
+                db.kg_insert_triple(&s, &p, &o, Some(chat_id), &vf, 0.72, "reflector", None)
+            })
+            .await;
+            kg_inserted += 1;
+        }
+        if kg_inserted > 0 {
+            info!(
+                "Reflector: chat {chat_id} -> {kg_inserted} knowledge graph triples added"
+            );
+        }
+    }
+
+    // 10. Enforce KG capacity limits — prune excess triples
+    if state.config.kg_max_triples_per_chat > 0 {
+        let max_kg = state.config.kg_max_triples_per_chat;
+        let _ = call_blocking(state.db.clone(), move |db| {
+            let pruned = db.kg_prune_excess(chat_id, max_kg)?;
+            if pruned > 0 {
+                info!(
+                    "Reflector: pruned {} excess KG triples for chat {} (limit: {})",
+                    pruned, chat_id, max_kg
+                );
+            }
+            Ok(())
+        })
+        .await;
+    }
+
+    // 11. Enforce memory capacity limits — archive excess low-confidence memories
+    if state.config.memory_max_entries_per_chat > 0 {
+        let max_per_chat = state.config.memory_max_entries_per_chat;
+        let _ = call_blocking(state.db.clone(), move |db| {
+            let archived = db.archive_excess_memories(Some(chat_id), max_per_chat)?;
+            if archived > 0 {
+                info!(
+                    "Reflector: archived {} excess memories for chat {} (limit: {})",
+                    archived, chat_id, max_per_chat
+                );
+            }
+            Ok(())
+        })
+        .await;
+    }
 
     if let Some(ts) = latest_message_ts {
         let _ = call_blocking(state.db.clone(), move |db| {
@@ -685,6 +832,200 @@ async fn reflect_for_chat(state: &Arc<AppState>, chat_id: i64) {
         .map(|_| ())
     })
     .await;
+}
+
+const SKILL_REVIEW_SYSTEM_PROMPT: &str = r#"You are a skill review specialist. Analyze conversations to identify reusable approaches that should be saved as skills.
+
+A "skill" is a set of step-by-step instructions for a task type the agent encountered. Only recommend creating a skill if:
+1. The conversation shows a non-trivial multi-step approach (5+ distinct steps)
+2. The approach required trial-and-error or domain-specific knowledge
+3. The approach is REUSABLE — it would help with similar future tasks
+4. No existing skill already covers this approach
+
+If you find a worthy skill, output EXACTLY one JSON object:
+{"create": true, "name": "skill-name", "description": "One-line description", "instructions": "Full markdown instructions"}
+
+If nothing is worth saving as a skill, output:
+{"create": false}
+
+Output ONLY the JSON object, no other text."#;
+
+async fn review_for_skill_creation(state: &Arc<AppState>, chat_id: i64) {
+    let min_tool_calls = state.config.skill_review_min_tool_calls;
+    if min_tool_calls == 0 {
+        return;
+    }
+
+    // Load recent messages to look for complex conversations
+    let messages = match call_blocking(state.db.clone(), move |db| {
+        db.get_recent_messages(chat_id, 50)
+    })
+    .await
+    {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+
+    // Count bot messages that look like tool results (heuristic: messages containing tool patterns)
+    let tool_call_heuristic = messages
+        .iter()
+        .filter(|m| {
+            m.is_from_bot
+                && (m.content.contains("tool_use")
+                    || m.content.contains("tool_result")
+                    || m.content.contains("Executing"))
+        })
+        .count();
+
+    // Also count by total message volume as a proxy (each tool call = ~3 messages: assistant+tool_result+assistant)
+    let estimated_tool_calls = messages.len() / 3;
+    let effective_count = tool_call_heuristic.max(estimated_tool_calls);
+
+    if effective_count < min_tool_calls {
+        return;
+    }
+
+    // Check if we already have many skills (avoid skill explosion)
+    let existing_skills = state.skills.discover_skills();
+    let agent_created_count = existing_skills
+        .iter()
+        .filter(|s| s.source == "agent-created")
+        .count();
+    if agent_created_count >= 20 {
+        info!(
+            "Skill review: skipping for chat {} — already {} agent-created skills",
+            chat_id, agent_created_count
+        );
+        return;
+    }
+
+    // Build conversation summary for the LLM
+    let conversation = messages
+        .iter()
+        .map(|m| {
+            format!(
+                "[{}]: {}",
+                m.sender_name,
+                strip_reflector_thinking_tags(&m.content)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let existing_skill_names: Vec<&str> = existing_skills.iter().map(|s| s.name.as_str()).collect();
+    let skills_hint = if existing_skill_names.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nExisting skills (do NOT duplicate): {}",
+            existing_skill_names.join(", ")
+        )
+    };
+
+    let user_msg = Message {
+        role: "user".into(),
+        content: MessageContent::Text(format!(
+            "Review this conversation for skill-worthy approaches:{skills_hint}\n\nConversation:\n{conversation}"
+        )),
+    };
+    let response = match state
+        .llm
+        .send_message(SKILL_REVIEW_SYSTEM_PROMPT, vec![user_msg], None)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Skill review: LLM call failed for chat {chat_id}: {e}");
+            return;
+        }
+    };
+
+    let text = response
+        .content
+        .iter()
+        .filter_map(|b| {
+            if let ResponseContentBlock::Text { text } = b {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    let cleaned = strip_reflector_thinking_tags(&text);
+    let trimmed = cleaned.trim();
+
+    // Parse the review result
+    let review: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => {
+            // Try finding JSON in the response
+            let start = trimmed.find('{').unwrap_or(0);
+            let end = trimmed.rfind('}').map(|i| i + 1).unwrap_or(trimmed.len());
+            match serde_json::from_str(&trimmed[start..end]) {
+                Ok(v) => v,
+                Err(_) => return,
+            }
+        }
+    };
+
+    if !review.get("create").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return;
+    }
+
+    let skill_name = match review.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+    let description = match review.get("description").and_then(|v| v.as_str()) {
+        Some(d) => d,
+        None => return,
+    };
+    let instructions = match review.get("instructions").and_then(|v| v.as_str()) {
+        Some(i) => i,
+        None => return,
+    };
+
+    // Check if skill already exists
+    if existing_skills.iter().any(|s| s.name == skill_name) {
+        return;
+    }
+
+    // Validate content
+    if microclaw_storage::memory_quality::scan_for_injection(instructions).is_err() {
+        warn!(
+            "Skill review: rejected auto-created skill '{}' due to injection scan failure",
+            skill_name
+        );
+        return;
+    }
+
+    // Write the skill
+    let skills_dir = std::path::PathBuf::from(state.config.skills_data_dir());
+    let skill_dir = skills_dir.join(&skill_name);
+    if let Err(e) = std::fs::create_dir_all(&skill_dir) {
+        error!("Skill review: failed to create directory for '{}': {}", skill_name, e);
+        return;
+    }
+
+    let content = format!(
+        "---\nname: {}\ndescription: {}\nsource: agent-created\nupdated_at: \"{}\"\n---\n{}\n",
+        skill_name,
+        description,
+        Utc::now().to_rfc3339(),
+        instructions
+    );
+
+    if let Err(e) = std::fs::write(skill_dir.join("SKILL.md"), &content) {
+        error!("Skill review: failed to write SKILL.md for '{}': {}", skill_name, e);
+        return;
+    }
+
+    info!(
+        "Skill review: auto-created skill '{}' from chat {} conversation",
+        skill_name, chat_id
+    );
 }
 
 #[cfg(test)]

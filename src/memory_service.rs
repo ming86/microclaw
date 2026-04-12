@@ -292,6 +292,80 @@ pub(crate) async fn maybe_handle_explicit_memory_command(
     )))
 }
 
+/// Sanitize a query string for memory retrieval.
+///
+/// AI agents sometimes prepend system prompts or tool definitions to user messages,
+/// which destroys embedding quality for semantic search. This sanitizer extracts the
+/// likely user intent by:
+/// 1. Detecting and stripping common system prompt patterns
+/// 2. Extracting the last meaningful sentence (most likely to be the actual query)
+/// 3. Truncating overly long queries that are likely contaminated
+fn sanitize_memory_query(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() < 200 {
+        // Short queries are unlikely to contain system prompt contamination
+        return trimmed.to_string();
+    }
+
+    // Check for system prompt contamination markers
+    let lower = trimmed.to_ascii_lowercase();
+    let contamination_markers = [
+        "you are a",
+        "you are an",
+        "your role is",
+        "system prompt",
+        "instructions:",
+        "<system>",
+        "tool_use",
+        "tool_result",
+        "[scheduler]:",
+        "as an ai assistant",
+    ];
+    let is_contaminated = contamination_markers.iter().any(|m| lower.contains(m));
+
+    if !is_contaminated {
+        // Not contaminated, but still truncate if very long
+        if trimmed.len() > 500 {
+            return trimmed.chars().take(500).collect();
+        }
+        return trimmed.to_string();
+    }
+
+    // Strategy: extract the last meaningful sentence (tail extraction)
+    // Split on sentence boundaries and take the last non-trivial one
+    let sentences: Vec<&str> = trimmed
+        .split(['.', '?', '!', '\n'])
+        .map(|s| s.trim())
+        .filter(|s| s.len() > 10)
+        .collect();
+
+    if let Some(last) = sentences.last() {
+        return last.chars().take(300).collect();
+    }
+
+    // Fallback: take the last 200 chars
+    let start = trimmed
+        .char_indices()
+        .rev()
+        .nth(199)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    trimmed[start..].to_string()
+}
+
+/// Build structured memory context using a 4-layer memory stack:
+///
+/// - **L0 (Identity)**: PROFILE memories — always loaded first. These define who the user is.
+///   Budget: up to 20% of total. Cost: ~100-200 tokens typically.
+/// - **L1 (Essential)**: Highest-confidence, most-recently-seen memories across all categories.
+///   These are the "essential story" — durable facts the agent should always know.
+///   Budget: up to 30% of total. Cost: ~300-500 tokens.
+/// - **L2 (Relevance)**: Query-relevant memories via semantic/keyword ranking.
+///   Loaded based on what the user is currently asking about.
+///   Budget: remaining tokens. Cost: variable.
+/// - **L3 (Deep Search)**: Not injected here — available via `structured_memory_search` tool
+///   for on-demand deep retrieval when the agent needs more context.
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn build_db_memory_context(
     memory_backend: &Arc<MemoryBackend>,
     db: &Arc<Database>,
@@ -299,7 +373,10 @@ pub(crate) async fn build_db_memory_context(
     chat_id: i64,
     query: &str,
     token_budget: usize,
+    l0_identity_pct: usize,
+    l1_essential_pct: usize,
 ) -> String {
+    let query = &sanitize_memory_query(query);
     let memories = match memory_backend.get_memories_for_context(chat_id, 100).await {
         Ok(m) => m,
         Err(_) => return String::new(),
@@ -309,93 +386,176 @@ pub(crate) async fn build_db_memory_context(
         return String::new();
     }
 
-    let mut ordered: Vec<&Memory> = Vec::new();
-    #[cfg(feature = "sqlite-vec")]
-    let mut retrieval_method = if memory_supports_local_semantic_ranking(memory_backend) {
-        "keyword"
-    } else {
-        "provider"
-    };
-    #[cfg(not(feature = "sqlite-vec"))]
-    let retrieval_method = "keyword";
+    let budget = token_budget.max(1);
+    // Clamp percentages to sane range; remaining goes to L2 relevance
+    let l0_pct = l0_identity_pct.min(50);
+    let l1_pct = l1_essential_pct.min(50);
+    let mut used_tokens = 0usize;
+    let mut out = String::from("<structured_memories>\n");
+    let mut injected_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
-    #[cfg(feature = "sqlite-vec")]
-    {
-        if let Some(provider) = embedding {
-            if memory_supports_local_semantic_ranking(memory_backend) && !query.trim().is_empty() {
-                if let Ok(query_vec) = provider.embed(query).await {
-                    let knn_result = call_blocking(db.clone(), move |db| {
-                        db.knn_memories(chat_id, &query_vec, 20)
-                    })
-                    .await;
-                    if let Ok(knn_rows) = knn_result {
-                        let by_id: std::collections::HashMap<i64, &Memory> =
-                            memories.iter().map(|m| (m.id, m)).collect();
-                        for (id, _) in knn_rows {
-                            if let Some(mem) = by_id.get(&id) {
-                                ordered.push(*mem);
+    // ── L0: Identity (PROFILE memories, up to l0_pct% of budget) ──
+    let l0_budget = budget * l0_pct / 100;
+    let mut profile_memories: Vec<&Memory> = memories
+        .iter()
+        .filter(|m| m.category == "PROFILE" && !m.is_archived)
+        .collect();
+    // Sort profiles by confidence desc, then recency
+    profile_memories.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if !profile_memories.is_empty() {
+        out.push_str("# Identity\n");
+        for m in &profile_memories {
+            let est = (m.content.len() / 4) + 10;
+            if used_tokens + est > l0_budget && !injected_ids.is_empty() {
+                break;
+            }
+            used_tokens += est;
+            injected_ids.insert(m.id);
+            let scope = if m.chat_id.is_none() { "global" } else { "chat" };
+            out.push_str(&format!("[PROFILE] [{}] {}\n", scope, m.content));
+        }
+    }
+
+    // ── L1: Essential Story (highest-confidence memories, up to l1_pct% of budget) ──
+    let l1_budget = used_tokens + (budget * l1_pct / 100);
+    let mut essential: Vec<&Memory> = memories
+        .iter()
+        .filter(|m| !m.is_archived && !injected_ids.contains(&m.id))
+        .collect();
+    // Score by confidence + recency (higher = more essential)
+    essential.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut l1_count = 0usize;
+    if !essential.is_empty() {
+        out.push_str("# Essential\n");
+        for m in &essential {
+            let est = (m.content.len() / 4) + 10;
+            if used_tokens + est > l1_budget {
+                break;
+            }
+            used_tokens += est;
+            injected_ids.insert(m.id);
+            l1_count += 1;
+            let scope = if m.chat_id.is_none() { "global" } else { "chat" };
+            out.push_str(&format!("[{}] [{}] {}\n", m.category, scope, m.content));
+        }
+    }
+
+    // ── L2: Relevance-ranked (query-dependent, fills remaining budget) ──
+    // Build relevance-ordered list from memories not yet injected
+    let remaining: Vec<&Memory> = memories
+        .iter()
+        .filter(|m| !injected_ids.contains(&m.id) && !m.is_archived)
+        .collect();
+
+    if !remaining.is_empty() {
+        let mut relevance_ordered: Vec<&Memory> = Vec::new();
+
+        #[cfg(feature = "sqlite-vec")]
+        let mut retrieval_method = if memory_supports_local_semantic_ranking(memory_backend) {
+            "keyword"
+        } else {
+            "provider"
+        };
+        #[cfg(not(feature = "sqlite-vec"))]
+        let retrieval_method = "keyword";
+
+        #[cfg(feature = "sqlite-vec")]
+        {
+            if let Some(provider) = embedding {
+                if memory_supports_local_semantic_ranking(memory_backend)
+                    && !query.trim().is_empty()
+                {
+                    if let Ok(query_vec) = provider.embed(query).await {
+                        let knn_result = call_blocking(db.clone(), move |db| {
+                            db.knn_memories(chat_id, &query_vec, 20)
+                        })
+                        .await;
+                        if let Ok(knn_rows) = knn_result {
+                            let by_id: std::collections::HashMap<i64, &&Memory> =
+                                remaining.iter().map(|m| (m.id, m)).collect();
+                            for (id, _) in knn_rows {
+                                if let Some(mem) = by_id.get(&id) {
+                                    relevance_ordered.push(**mem);
+                                }
                             }
-                        }
-                        if !ordered.is_empty() {
-                            retrieval_method = "knn";
+                            if !relevance_ordered.is_empty() {
+                                retrieval_method = "knn";
+                            }
                         }
                     }
                 }
             }
         }
-    }
 
-    #[cfg(not(feature = "sqlite-vec"))]
-    {
-        let _ = embedding;
-    }
-
-    if ordered.is_empty() {
-        let query_tokens = tokenize_for_relevance(query);
-        let mut scored: Vec<(usize, usize, &Memory)> = memories
-            .iter()
-            .enumerate()
-            .map(|(idx, m)| {
-                (
-                    score_relevance_with_cache(&m.content, &query_tokens),
-                    idx,
-                    m,
-                )
-            })
-            .collect();
-        if !query.is_empty() {
-            scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        }
-        ordered = scored.into_iter().map(|(_, _, m)| m).collect();
-    }
-
-    let mut out = String::from("<structured_memories>\n");
-    let mut used_tokens = 0usize;
-    let mut omitted = 0usize;
-    let budget = token_budget.max(1);
-
-    for (idx, m) in ordered.iter().enumerate() {
-        let estimated_tokens = (m.content.len() / 4) + 10;
-        if used_tokens + estimated_tokens > budget {
-            omitted = ordered.len().saturating_sub(idx);
-            break;
+        #[cfg(not(feature = "sqlite-vec"))]
+        {
+            let _ = embedding;
         }
 
-        used_tokens += estimated_tokens;
-        let scope = if m.chat_id.is_none() {
-            "global"
-        } else {
-            "chat"
-        };
-        out.push_str(&format!("[{}] [{}] {}\n", m.category, scope, m.content));
+        if relevance_ordered.is_empty() {
+            let query_tokens = tokenize_for_relevance(query);
+            let mut scored: Vec<(usize, usize, &&Memory)> = remaining
+                .iter()
+                .enumerate()
+                .map(|(idx, m)| {
+                    (
+                        score_relevance_with_cache(&m.content, &query_tokens),
+                        idx,
+                        m,
+                    )
+                })
+                .collect();
+            if !query.is_empty() {
+                scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            }
+            relevance_ordered = scored.into_iter().map(|(_, _, m)| *m).collect();
+        }
+
+        let mut l2_count = 0usize;
+        let mut l2_omitted = 0usize;
+        if !relevance_ordered.is_empty() {
+            out.push_str("# Relevant\n");
+        }
+        for (idx, m) in relevance_ordered.iter().enumerate() {
+            let est = (m.content.len() / 4) + 10;
+            if used_tokens + est > budget {
+                l2_omitted = relevance_ordered.len().saturating_sub(idx);
+                break;
+            }
+            used_tokens += est;
+            injected_ids.insert(m.id);
+            l2_count += 1;
+            let scope = if m.chat_id.is_none() { "global" } else { "chat" };
+            out.push_str(&format!("[{}] [{}] {}\n", m.category, scope, m.content));
+        }
+
+        if l2_omitted > 0 {
+            out.push_str(&format!(
+                "(+{l2_omitted} memories available via structured_memory_search tool)\n"
+            ));
+        }
+
+        let _ = retrieval_method;
+        let _ = l1_count;
+        let _ = l2_count;
     }
-    if omitted > 0 {
-        out.push_str(&format!("(+{omitted} memories omitted)\n"));
-    }
+
     out.push_str("</structured_memories>\n");
 
-    let candidate_count = ordered.len();
-    let selected_count = candidate_count.saturating_sub(omitted);
+    let candidate_count = memories.len();
+    let selected_count = injected_ids.len();
+    let omitted = candidate_count.saturating_sub(selected_count);
+    let retrieval_method = "layered";
     let retrieval_method_owned = retrieval_method.to_string();
     let _ = call_blocking(db.clone(), move |d| {
         d.log_memory_injection(
@@ -410,8 +570,8 @@ pub(crate) async fn build_db_memory_context(
     })
     .await;
     info!(
-        "Memory injection: chat {} -> {} memories, method={}, tokens_est={}, omitted={}",
-        chat_id, selected_count, retrieval_method, used_tokens, omitted
+        "Memory injection (4-layer): chat {} -> {}/{} memories (L0:identity + L1:essential + L2:relevant), tokens_est={}, omitted={}",
+        chat_id, selected_count, candidate_count, used_tokens, omitted
     );
     out
 }
