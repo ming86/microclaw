@@ -53,6 +53,7 @@ It works with Anthropic and OpenAI-compatible providers, supports multi-step too
 - **Persistent by default**: sessions resume, memory survives restarts, and scheduled tasks keep running in the background.
 - **Provider-agnostic**: use Anthropic or OpenAI-compatible APIs without rewriting the runtime.
 - **Extensible where it matters**: add skills, MCP servers, plugins, hooks, and new channel adapters without replacing the core.
+- **Runs on a $5 VPS**: a single static Rust binary with embedded SQLite — no Python interpreter, no separate vector DB, no service mesh. RAM/CPU footprint is small enough for the cheapest cloud tier (1 vCPU / 1 GB).
 
 ## Quick Start
 
@@ -300,6 +301,12 @@ For a deeper dive into the architecture and design decisions, read: **[Building 
 - **Tool result truncation + artifacts** -- oversized tool outputs auto-stash to disk with head/tail kept in context; the agent can pull slices by id via `fetch_artifact`
 - **Skill lifecycle** -- end-of-turn review can patch existing skills (not just create), activation is tracked, unused skills auto-archive after 30 days, and the prompt-side catalog is retrieval-gated to top-K matches
 - **Message splitting** -- long responses are automatically split at newline boundaries to fit channel limits (Telegram 4096 / Discord 2000 / Slack 4000 / Feishu 4000 / IRC ~380)
+- **Anthropic prompt caching** -- system prompt + last 3 messages get `cache_control` breakpoints on every Anthropic request, so multi-turn chats reuse the cached prefix and recurring input cost drops ~75%
+- **Fuzzy `edit_file` matching** -- when `old_string` doesn't byte-match exactly, the tool retries through 8 strategies (line-trimmed, indent-flexible, escape-normalized, smart-quote-aware, block-anchor, …), reports which one matched, and refuses tool-call escape-drift artifacts that would corrupt source
+- **Tool-loop guardrails** -- per-turn warnings when an idempotent tool returns the same result repeatedly or when any tool fails several times in a row, so the model stops looping without being hard-blocked
+- **Filesystem checkpoints + `/rewind`** -- opt-in shadow-git snapshot of the chat's working dir at the start of every turn (under `<data_dir>/checkpoints/`); list and restore from chat with `/rewind` and `/rewind <hash>`
+- **`@`-prefix context references** -- `@file:path`, `@file:path:lines`, `@folder:dir`, `@diff`, `@staged`, `@url:…` in user messages are expanded server-side into an attached-context block, so the LLM sees the content directly without an extra `read_file`/`web_fetch` round-trip; sensitive paths and SSRF targets are blocked
+- **Subdirectory `AGENTS.md` hints** -- when a tool call touches a subdirectory, microclaw walks up to 5 ancestors looking for `AGENTS.md` / `CLAUDE.md` / `.cursorrules` and lazily appends the nearest one to that tool's result, once per turn
 
 ## Tools
 
@@ -308,7 +315,7 @@ For a deeper dive into the architecture and design decisions, read: **[Building 
 | `bash` | Execute shell commands with configurable timeout |
 | `read_file` | Read files with line numbers, optional offset/limit |
 | `write_file` | Create or overwrite files (auto-creates directories) |
-| `edit_file` | Find-and-replace editing with uniqueness validation |
+| `edit_file` | Find-and-replace editing with uniqueness validation; falls back through whitespace/indent/escape/smart-quote/block-anchor strategies when `old_string` doesn't byte-match exactly |
 | `glob` | Find files by pattern (`**/*.rs`, `src/**/*.ts`) |
 | `grep` | Regex search across file contents |
 | `read_memory` | Read persistent AGENTS.md memory (`global`, `bot`, or `chat`) |
